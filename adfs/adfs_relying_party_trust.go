@@ -1,12 +1,13 @@
 package adfs
 
 import (
-	"bytes"
-	"context"
+	"encoding/json"
 	"fmt"
-	"strings"
-
+	"github.com/gerardlemetayerc/terraform-provider-adfs/adfs/helpers"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"log"
+	"os/exec"
+	"strings"
 )
 
 func resourceAdfsRelyingPartyTrust() *schema.Resource {
@@ -15,136 +16,268 @@ func resourceAdfsRelyingPartyTrust() *schema.Resource {
 		Read:   resourceAdfsRelyingPartyTrustRead,
 		Update: resourceAdfsRelyingPartyTrustUpdate,
 		Delete: resourceAdfsRelyingPartyTrustDelete,
+
 		Schema: map[string]*schema.Schema{
 			"name": {
 				Type:     schema.TypeString,
 				Required: true,
 			},
-			"target_identifier": {
+			"identifier": {
 				Type:     schema.TypeString,
 				Required: true,
 			},
-			"claims_rules": {
+			"signing_certificate": {
+				Type:     schema.TypeString,
+				Optional: true,
+			},
+			"endpoints": {
 				Type:     schema.TypeList,
+				Optional: true,
 				Elem:     &schema.Schema{Type: schema.TypeString},
-				Optional: true,
 			},
-			"description": {
-				Type:     schema.TypeString,
+			"issuance_transform_rules": {
+				Type:     schema.TypeList,
 				Optional: true,
-			},
-			"notes": {
-				Type:     schema.TypeString,
-				Optional: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"rule_template": {
+							Type:     schema.TypeString,
+							Required: true,
+						},
+						"rule_name": {
+							Type:     schema.TypeString,
+							Required: true,
+						},
+						"rule": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+						"condition": {
+							Type:     schema.TypeList,
+							MaxItems: 1,
+							Optional: true,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"type":   {Type: schema.TypeString, Required: true},
+									"issuer": {Type: schema.TypeString, Required: true},
+								},
+							},
+						},
+						"action": {
+							Type:     schema.TypeList,
+							Optional: true,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"store": {
+										Type:     schema.TypeString,
+										Optional: true,
+									},
+									"types": {
+										Type:     schema.TypeList,
+										Optional: true,
+										Elem:     &schema.Schema{Type: schema.TypeString},
+									},
+									"query": {
+										Type:     schema.TypeString,
+										Optional: true,
+									},
+									"param": {
+										Type:     schema.TypeString,
+										Optional: true,
+									},
+								},
+							},
+						},
+					},
+				},
 			},
 		},
 	}
 }
 
 func resourceAdfsRelyingPartyTrustCreate(d *schema.ResourceData, m interface{}) error {
-	ctx := context.Background()
-
-	config := m.(*AdfsConfig)
-	client := config.Client
-
 	name := d.Get("name").(string)
-	targetIdentifier := d.Get("target_identifier").(string)
-	claimsRules := d.Get("claims_rules").([]string)
-	claimsRulesStr := strings.Join(claimsRules, ";")
-
-	command := fmt.Sprintf(
-		"New-AdfsRelyingPartyTrust -Name '%s' -Identifier '%s' -ClaimsRules '%s'",
-		name, targetIdentifier, claimsRulesStr,
-	)
-
-	_, err := client.RunWithContext(ctx, command, &bytes.Buffer{}, &bytes.Buffer{})
+	identifier := d.Get("identifier").(string)
+	config := m.(*AdfsConfig)
+	output, err := helpers.ExecutePowershellCommand(config.PowershellBin, fmt.Sprintf("Add-AdfsRelyingPartyTrust -Name '%s' -Identifier '%s'", name, identifier))
 	if err != nil {
-		return fmt.Errorf("Erreur lors de la création du relying party trust : %v", err)
+		return fmt.Errorf("error creating relying party trust: %s", string(output))
 	}
 
-	d.SetId(name)
+	d.SetId(identifier)
 
-	return nil
+	if err := applyIssuanceTransformRules(d); err != nil {
+		return err
+	}
+
+	return resourceAdfsRelyingPartyTrustRead(d, m)
 }
 
 func resourceAdfsRelyingPartyTrustRead(d *schema.ResourceData, m interface{}) error {
-	ctx := context.Background()
-
+	identifier := d.Id()
 	config := m.(*AdfsConfig)
-	client := config.Client
 
-	name := d.Get("name").(string)
+	// Exécuter la commande PowerShell
+	output, err := helpers.ExecutePowershellCommand(config.PowershellBin, fmt.Sprintf(
+		"Get-AdfsRelyingPartyTrust -Identifier '%s' | Select Name, Identifier, IssuanceTransformRules | ConvertTo-Json -Depth 10", identifier,
+	))
 
-	command := fmt.Sprintf(
-		"$trust = Get-AdfsRelyingPartyTrust -Name '%s' "+
-			"if ($trust) { "+
-			"return @{ 'name' = $trust.Name; 'identifier' = $trust.Identifier; 'claims_rules' = $trust.ClaimsRules -join ';' } "+
-			"} else { throw \"Relying party trust avec le nom '%s' non trouvé\" }",
-		name, name,
-	)
-
-	var stdout bytes.Buffer
-	_, err := client.RunWithContext(ctx, command, &stdout, &bytes.Buffer{})
 	if err != nil {
-		return fmt.Errorf("Erreur lors de la lecture du relying party trust : %v", err)
+		if strings.Contains(output, "not found") {
+			d.SetId("")
+			return nil
+		}
+		return fmt.Errorf("error reading relying party trust: %s", output)
 	}
 
-	results := parsePowerShellOutput(stdout.String())
+	// Conversion de la sortie en []byte avant l'interprétation JSON
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		return fmt.Errorf("error parsing JSON output: %s", err)
+	}
 
-	d.Set("name", results["name"])
-	d.Set("target_identifier", results["identifier"])
-	d.Set("claims_rules", strings.Split(results["claims_rules"], ";"))
+	// Remplir les valeurs de la ressource avec les données lues
+	if name, ok := result["Name"].(string); ok {
+		d.Set("name", name)
+	}
+	if identifiers, ok := result["Identifier"].([]interface{}); ok && len(identifiers) > 0 {
+		d.Set("identifier", identifiers[0])
+	}
+
+	// Parser les règles de transformation, si présentes
+	if rules, ok := result["IssuanceTransformRules"].(string); ok {
+		parsedRules, _ := helpers.ParseIssuanceTransformRules(rules)
+		log.Printf("[DEBUG] Parsed issuance transform rules: %+v", parsedRules)
+		d.Set("issuance_transform_rules", parsedRules)
+	}
 
 	return nil
 }
 
 func resourceAdfsRelyingPartyTrustUpdate(d *schema.ResourceData, m interface{}) error {
-	ctx := context.Background()
+	if err := executeAdfsCommand("Set-AdfsRelyingPartyTrust", buildAdfsArgs(d)); err != nil {
+		return err
+	}
 
-	config := m.(*AdfsConfig)
-	client := config.Client
+	if d.HasChange("issuance_transform_rules") {
+		if err := applyIssuanceTransformRules(d); err != nil {
+			return err
+		}
+	}
 
+	return resourceAdfsRelyingPartyTrustRead(d, m)
+}
+
+func resourceAdfsRelyingPartyTrustDelete(d *schema.ResourceData, m interface{}) error {
 	name := d.Get("name").(string)
-	//targetIdentifier := d.Get("target_identifier").(string)
-	claimsRules := d.Get("claims_rules").([]string)
-	claimsRulesStr := strings.Join(claimsRules, ";")
 
-	command := fmt.Sprintf(
-		"$trust = Get-AdfsRelyingPartyTrust -Name '%s' "+
-			"if ($trust) { "+
-			"$trust.ClaimsRules = '%s'.split(';'); "+
-			"$trust | Set-AdfsRelyingPartyTrust "+
-			"} else { throw \"Relying party trust avec le nom '%s' non trouvé\" }",
-		name, claimsRulesStr, name,
-	)
-
-	_, err := client.RunWithContext(ctx, command, &bytes.Buffer{}, &bytes.Buffer{})
+	cmd := exec.Command("powershell", "-Command", fmt.Sprintf("Remove-AdfsRelyingPartyTrust -TargetName '%s'", name))
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("Erreur lors de la mise à jour du relying party trust : %v", err)
+		return fmt.Errorf("error deleting relying party trust: %s", string(output))
+	}
+	d.SetId("")
+	return nil
+}
+
+func buildAdfsArgs(d *schema.ResourceData) string {
+	args := fmt.Sprintf("-TargetName '%s' -Identifier '%s'", d.Get("name").(string), d.Get("identifier").(string))
+
+	if signingCertificate, ok := d.GetOk("signing_certificate"); ok {
+		args += fmt.Sprintf(" -SigningCertificate '%s'", signingCertificate.(string))
+	}
+
+	if endpoints, ok := d.GetOk("endpoints"); ok {
+		var endpointStr strings.Builder
+		for _, endpoint := range endpoints.([]interface{}) {
+			endpointStr.WriteString(fmt.Sprintf("'%s',", endpoint.(string)))
+		}
+		args += fmt.Sprintf(" -Endpoints @(%s)", strings.TrimSuffix(endpointStr.String(), ","))
+	}
+
+	return args
+}
+
+func applyIssuanceTransformRules(d *schema.ResourceData) error {
+	rules, ok := d.GetOk("issuance_transform_rules")
+	if !ok {
+		return nil
+	}
+
+	ruleStr := buildIssuanceTransformRules(rules.([]interface{}))
+	cmd := exec.Command("powershell", "-Command", fmt.Sprintf(
+		"Set-AdfsRelyingPartyTrust -TargetName '%s' -Identifier '%s' -IssuanceTransformRules '%s'",
+		d.Get("name").(string), d.Get("identifier").(string), escapeSingleQuotes(ruleStr),
+	))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("error applying issuance transform rules: %s", string(output))
 	}
 
 	return nil
 }
 
-func resourceAdfsRelyingPartyTrustDelete(d *schema.ResourceData, m interface{}) error {
-	ctx := context.Background()
+func buildIssuanceTransformRules(rules []interface{}) string {
+	var builder strings.Builder
 
-	config := m.(*AdfsConfig)
-	client := config.Client
+	for _, r := range rules {
+		rule := r.(map[string]interface{})
+		ruleName := rule["rule_name"].(string)
 
-	name := d.Get("name").(string)
+		builder.WriteString(fmt.Sprintf("@RuleName = \"%s\"\n", ruleName))
 
-	command := fmt.Sprintf(
-		"Remove-AdfsRelyingPartyTrust -Name '%s'",
-		name,
-	)
+		if ruleTemplate, ok := rule["rule_template"].(string); ok && ruleTemplate == "CustomRule" {
+			builder.WriteString(rule["rule"].(string))
+			builder.WriteString("\n")
+			continue
+		}
 
-	_, err := client.RunWithContext(ctx, command, &bytes.Buffer{}, &bytes.Buffer{})
-	if err != nil {
-		return fmt.Errorf("Erreur lors de la suppression du relying party trust : %v", err)
+		builder.WriteString(fmt.Sprintf("@RuleTemplate = \"%s\"\n", rule["rule_template"].(string)))
+
+		if condition, ok := rule["condition"].([]interface{}); ok && len(condition) > 0 {
+			cond := condition[0].(map[string]interface{})
+			builder.WriteString(fmt.Sprintf("c:[Type == \"%s\", Issuer == \"%s\"] ", cond["type"], cond["issuer"]))
+		}
+
+		if actions, ok := rule["action"].([]interface{}); ok && len(actions) > 0 {
+			builder.WriteString("=> issue(")
+			action := actions[0].(map[string]interface{})
+			var actionParts []string
+
+			if store, ok := action["store"].(string); ok {
+				actionParts = append(actionParts, fmt.Sprintf("store = \"%s\"", store))
+			}
+			if types, ok := action["types"].([]interface{}); ok {
+				var typesStr []string
+				for _, t := range types {
+					typesStr = append(typesStr, fmt.Sprintf("\"%s\"", t.(string)))
+				}
+				actionParts = append(actionParts, fmt.Sprintf("types = (%s)", strings.Join(typesStr, ", ")))
+			}
+			if query, ok := action["query"].(string); ok {
+				actionParts = append(actionParts, fmt.Sprintf("query = \"%s\"", query))
+			}
+			if param, ok := action["param"].(string); ok {
+				actionParts = append(actionParts, fmt.Sprintf("param = %s", param))
+			}
+
+			builder.WriteString(strings.Join(actionParts, ", "))
+			builder.WriteString(");\n")
+		}
 	}
 
-	d.SetId("")
+	return builder.String()
+}
 
+func executeAdfsCommand(command string, args string) error {
+	cmd := exec.Command("powershell", "-Command", fmt.Sprintf("%s %s", command, args))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("error executing %s: %s", command, string(output))
+	}
 	return nil
+}
+
+func escapeSingleQuotes(input string) string {
+	return strings.ReplaceAll(input, "'", "''")
 }
