@@ -14,6 +14,22 @@ func Provider() *schema.Provider {
 				Default:     "powershell",
 				Description: "Powershell binary",
 			},
+			"hostname": {
+				Type:        schema.TypeString,
+				Required:    true,
+				Default:     "localhost",
+				Description: "Host which own ADFS configuration",
+			},
+			"username": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "Remote username",
+			},
+			"password": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "Remote user password",
+			},
 		},
 		ResourcesMap: map[string]*schema.Resource{
 			"adfs_relying_party_trust": resourceAdfsRelyingPartyTrust(),
